@@ -1,0 +1,254 @@
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+import plotly.graph_objects as go
+
+st.set_page_config(
+    page_title="Equity Factor Exposure Analyzer",
+    layout="wide"
+)
+
+st.title("Equity Factor Exposure Analyzer")
+st.caption("Designed for Macro & Equity Derivatives Sales")
+
+# -----------------------------
+# Sidebar Controls
+# -----------------------------
+st.sidebar.header("Inputs")
+
+ticker = st.sidebar.text_input("Stock Ticker", value="AAPL").upper()
+start_date = st.sidebar.date_input("Start Date", value=pd.to_datetime("2021-01-01"))
+end_date = st.sidebar.date_input("End Date", value=pd.to_datetime("today"))
+
+method = st.sidebar.radio("Exposure Method", ["Regression", "PCA"])
+
+# -----------------------------
+# Data Loader
+# -----------------------------
+@st.cache_data
+def load_data(ticker, start, end):
+    def fetch_adj_close(sym):
+        """Fetch adjusted close as a pd.Series for symbol `sym`, handling different yfinance return shapes."""
+        data = yf.download(sym, start=start, end=end, progress=False)
+        if isinstance(data, pd.Series):
+            s = data
+        elif isinstance(data, pd.DataFrame):
+            # MultiIndex columns (e.g., when multiple tickers) or flat DataFrame
+            if isinstance(data.columns, pd.MultiIndex):
+                # Try selecting the 'Adj Close' level
+                try:
+                    adj = data['Adj Close']
+                    # If multiple tickers, pick the requested symbol column if present
+                    if isinstance(adj, pd.DataFrame):
+                        if sym in adj.columns:
+                            s = adj[sym]
+                        else:
+                            s = adj.iloc[:, 0]
+                    else:
+                        s = adj
+                except Exception:
+                    # Fallback: try to squeeze the dataframe
+                    s = data.iloc[:, 0]
+            else:
+                if 'Adj Close' in data.columns:
+                    s = data['Adj Close']
+                elif 'Adj_Close' in data.columns:
+                    s = data['Adj_Close']
+                elif 'Close' in data.columns:
+                    s = data['Close']
+                else:
+                    # As a last resort, take the first column
+                    s = data.iloc[:, 0]
+        else:
+            return pd.Series(dtype=float)
+
+        # Ensure Series and drop NaNs
+        s = s.dropna()
+        # If empty, return an empty Series
+        if s.empty:
+            return pd.Series(dtype=float)
+        s.name = sym
+        return s
+
+    stock = fetch_adj_close(ticker)
+    spy = fetch_adj_close('SPY')
+    qqq = fetch_adj_close('QQQ')
+    vix = fetch_adj_close('^VIX')
+
+    df = pd.DataFrame({
+        'Stock': stock,
+        'Market': spy,
+        'Growth': qqq,
+        'VIX': vix
+    }).dropna()
+
+    returns = df.pct_change().dropna()
+
+    factors = pd.DataFrame(index=returns.index)
+    factors["Market"] = returns["Market"]
+    factors["Value"] = returns["Market"] - returns["Growth"]
+    factors["Momentum"] = returns["Stock"].rolling(60).mean()
+    factors["Volatility"] = returns["VIX"]
+    factors["Carry"] = yf.Ticker(ticker).info.get("dividendYield", 0)
+
+    return returns["Stock"], factors.dropna()
+
+stock_returns, factor_returns = load_data(ticker, start_date, end_date)
+
+st.subheader(f"{ticker} Factor Exposure Analysis")
+
+# -----------------------------
+# REGRESSION
+# -----------------------------
+if method == "Regression":
+
+    X = sm.add_constant(factor_returns)
+    model = sm.OLS(stock_returns.loc[X.index], X).fit()
+
+    # Safely remove intercept if present
+    params = model.params
+    tvals = model.tvalues
+    if "const" in params.index:
+        exposures = params.drop("const")
+    else:
+        exposures = params.copy()
+    if "const" in tvals.index:
+        tstats = tvals.drop("const")
+    else:
+        tstats = tvals.copy()
+
+    # Ensure exposures contain expected factor columns; fill missing with 0
+    exposures = exposures.reindex(factor_returns.columns).fillna(0)
+    tstats = tstats.reindex(factor_returns.columns).fillna(0)
+
+    df_exposure = pd.DataFrame({
+        "Exposure": exposures,
+        "t-stat": tstats
+    })
+
+    st.markdown("### Factor Exposures (Regression)")
+    st.dataframe(df_exposure.style.format("{:.2f}"))
+
+    fig = go.Figure(go.Bar(
+        x=df_exposure.index,
+        y=df_exposure["Exposure"],
+        marker_color="navy"
+    ))
+
+    fig.update_layout(
+        title="Factor Loadings",
+        yaxis_title="Beta",
+        xaxis_title="Factor",
+        height=400
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    # -----------------------------
+    # Plain-English Report
+    # -----------------------------
+    st.markdown("### Factor Interpretation")
+
+    for factor, beta in exposures.items():
+        if abs(beta) > 0.3:
+            direction = "positive" if beta > 0 else "negative"
+            st.markdown(
+                f"• **{factor}** is a **key driver** with **{direction} exposure** (β = {beta:.2f})"
+            )
+
+    st.markdown(
+        f"""
+        **Sales takeaway:**  
+        {ticker} behaves primarily as a **{ 'high beta' if exposures['Market'] > 1 else 'defensive' }** equity with
+        meaningful sensitivity to **{exposures.abs().idxmax()}**.
+        """
+    )
+
+# -----------------------------
+# PCA
+# -----------------------------
+else:
+    # Prepare factor matrix for PCA: drop constant columns and standardize
+    fr = factor_returns.copy()
+    # drop columns with zero variance
+    zero_var_cols = fr.columns[fr.var() == 0]
+    if len(zero_var_cols) > 0:
+        st.warning(f"Dropping constant factor columns for PCA: {', '.join(zero_var_cols)}")
+        fr = fr.drop(columns=zero_var_cols)
+
+    if fr.shape[0] < 2 or fr.shape[1] < 1:
+        st.warning("Not enough data/variables to run PCA.")
+        st.stop()
+
+    # Standardize factors
+    scaler = StandardScaler()
+    fr_scaled = scaler.fit_transform(fr)
+
+    n_components = min(3, fr.shape[1], fr.shape[0])
+    pca = PCA(n_components=n_components)
+    components = pca.fit_transform(fr_scaled)
+
+    # Build loadings DataFrame dynamically based on n_components
+    pc_cols = [f"PC{i+1}" for i in range(n_components)]
+    loadings = pd.DataFrame(
+        pca.components_.T,
+        index=fr.columns,
+        columns=pc_cols
+    )
+
+    st.markdown("### PCA Factor Loadings")
+    st.dataframe(loadings.style.format("{:.2f}"))
+
+    explained = pca.explained_variance_ratio_
+
+    fig = go.Figure(go.Bar(
+        x=pc_cols,
+        y=explained,
+        marker_color="darkgreen"
+    ))
+
+    fig.update_layout(
+        title="Explained Variance by Principal Component",
+        yaxis_title="Variance Explained",
+        height=400
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown(
+        """
+        **Interpretation:**  
+        PCA identifies the dominant *hidden macro drivers* of the stock.
+        Useful when pitching **dispersion**, **relative value**, or **pair trades**.
+        """
+    )
+
+    # -----------------------------
+    # PCA Summary (Sales-style takeaway)
+    # -----------------------------
+    try:
+        top_pc = 0
+        pc1_var = explained[top_pc] if len(explained) > top_pc else 0.0
+        if 'PC1' in loadings.columns:
+            pc1_loadings = loadings['PC1']
+        else:
+            pc1_loadings = loadings.iloc[:, 0]
+
+        dominant_factor = pc1_loadings.abs().idxmax()
+        dominant_loading = pc1_loadings.loc[dominant_factor]
+        direction = "positive" if dominant_loading > 0 else "negative"
+
+        st.markdown("### PCA Sales Takeaway")
+        st.markdown(
+            f"**Sales takeaway:** PC1 explains **{pc1_var*100:.1f}%** of variance. "
+            f"The dominant loading on PC1 is **{dominant_factor}** with a **{direction}** exposure "
+            f"(loading = {dominant_loading:.2f}). Use this to highlight the stock's sensitivity to {dominant_factor} in pitches."
+        )
+    except Exception:
+        pass
+
+st.success("Factor exposure analysis complete.")
