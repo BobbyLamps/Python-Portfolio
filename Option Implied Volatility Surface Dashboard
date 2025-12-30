@@ -1,0 +1,269 @@
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from scipy.interpolate import griddata, Rbf
+from scipy.ndimage import gaussian_filter
+import plotly.graph_objects as go
+from datetime import datetime
+
+st.set_page_config(page_title="Options Surface Cleaner & Interpolator", layout="wide")
+
+st.markdown("<h1 style='color:#FFFFFF;'>Options Surface Cleaner & Interpolator</h1>", unsafe_allow_html=True)
+
+# Dark theme CSS
+st.markdown(
+    """
+    <style>
+    /* Page background and main text */
+    .reportview-container, .main, .block-container, .stApp { background-color:#0b0b0b; color:#ffffff; }
+    /* Sidebar container */
+    [role="complementary"] { background-color:#0b0b0b !important; color:#ffffff !important; }
+    /* Make labels and widget text in the sidebar white */
+    [role="complementary"] label, [role="complementary"] .stTextInput, [role="complementary"] .stSelectbox, [role="complementary"] .stMultiSelect { color:#ffffff !important; }
+    /* Ticker input: black text on white background for readability */
+    [role="complementary"] input[type="text"] { color:#000000 !important; background-color:#ffffff !important; border:1px solid #444 !important; }
+    /* DataFrame styling (keep dark) */
+    [data-testid="stDataFrame"] { background-color:#0b0b0b !important; color:#ffffff !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# --------------------------
+# Sidebar Controls
+# --------------------------
+st.sidebar.markdown("<h3 style='color:#000000;'>Inputs</h3>", unsafe_allow_html=True)
+
+ticker = st.sidebar.text_input("Ticker", value="AAPL").upper()
+option_type = st.sidebar.selectbox("Option Type", ["call", "put"])
+expiry_select = None
+
+interpolation_method = st.sidebar.selectbox("Interpolation Method", ["Cubic", "Linear", "Nearest"])
+
+# --------------------------
+# Load Option Chain
+# --------------------------
+@st.cache_data
+def load_option_chain(ticker):
+    """Return a list of expirations for `ticker` (pickle-serializable)."""
+    try:
+        stock = yf.Ticker(ticker)
+        expirations = list(stock.options or [])
+        return expirations
+    except Exception as e:
+        st.error(f"Error loading ticker {ticker}: {e}")
+        return []
+
+expirations = load_option_chain(ticker)
+
+if not expirations:
+    st.warning(f"No option expirations found for {ticker}.")
+
+# Allow multi-select of expirations to build a true 2D surface across expiry axis
+expiry_selects = st.sidebar.multiselect("Expiration Date(s)", options=expirations, default=(expirations[:2] if expirations else []))
+if not expiry_selects:
+    st.warning("Please select one or more expiration dates to build the surface.")
+    st.stop()
+
+# For downstream compatibility use the first selected expiry when a single-expiry table is needed
+expiry_select = expiry_selects[0]
+
+@st.cache_data
+def get_option_data(ticker, expiry, option_type):
+    """Fetch and clean option chain DataFrame for (ticker, expiry, option_type)."""
+    stock = yf.Ticker(ticker)
+    if option_type == "call":
+        df = stock.option_chain(expiry).calls
+    else:
+        df = stock.option_chain(expiry).puts
+    # Normalize implied vol column name (yfinance uses 'impliedVolatility')
+    if 'impliedVol' in df.columns:
+        vol_col = 'impliedVol'
+    elif 'impliedVolatility' in df.columns:
+        vol_col = 'impliedVolatility'
+        df = df.rename(columns={vol_col: 'impliedVol'})
+        vol_col = 'impliedVol'
+    else:
+        st.warning("Option chain does not contain implied volatility column.")
+        return pd.DataFrame()
+
+    # Clean data
+    df = df[df['impliedVol'].notnull()]
+    df = df[df['impliedVol'] > 0]
+    df = df[df['impliedVol'] < 3.0]  # Remove extreme outliers (>300%)
+    return df
+
+df = get_option_data(ticker, expiry_select, option_type)
+
+if df.empty:
+    st.warning("No valid options data available for this expiry and type.")
+    st.stop()
+
+# Show header with all selected expiries
+exp_label = ", ".join(expiry_selects)
+st.subheader(f"{ticker.upper()} {option_type.capitalize()} Options - Expiry(s): {exp_label}")
+
+# Build combined table for all selected expiries
+def build_combined_df(ticker, expiries, option_type):
+    rows = []
+    for exp in expiries:
+        dfe = get_option_data(ticker, exp, option_type)
+        if dfe.empty:
+            continue
+        try:
+            dt = pd.to_datetime(exp)
+            days = max(1, (dt.date() - pd.Timestamp.today().date()).days)
+        except Exception:
+            days = 30
+        dfe = dfe.copy()
+        dfe['expiry'] = exp
+        dfe['days_to_expiry'] = days
+        rows.append(dfe[['expiry','days_to_expiry','strike','lastPrice','impliedVol','volume','openInterest']])
+    if not rows:
+        return pd.DataFrame()
+    return pd.concat(rows, ignore_index=True)
+
+combined_df = build_combined_df(ticker, expiry_selects, option_type)
+if combined_df.empty:
+    st.warning("No options data to display for selected expiries.")
+else:
+    st.dataframe(combined_df.reset_index(drop=True))
+
+# --------------------------
+# Interpolation / Surface
+# --------------------------
+def build_surface_points(ticker, expiries, option_type):
+    """Fetch option data for each expiry and return arrays of strikes, days_to_expiry, ivs."""
+    strikes_all = []
+    days_all = []
+    ivs_all = []
+    for exp in expiries:
+        dfe = get_option_data(ticker, exp, option_type)
+        if dfe.empty:
+            continue
+        try:
+            dt = pd.to_datetime(exp)
+            days = max(1, (dt.date() - pd.Timestamp.today().date()).days)
+        except Exception:
+            days = 30
+        svals = dfe['strike'].values
+        ivvals = dfe['impliedVol'].values
+        strikes_all.extend(svals.tolist())
+        days_all.extend([days] * len(svals))
+        ivs_all.extend(ivvals.tolist())
+    return np.array(strikes_all), np.array(days_all), np.array(ivs_all)
+
+# Build surface point cloud from selected expiries
+strikes, days, ivs = build_surface_points(ticker, expiry_selects, option_type)
+
+if strikes.size == 0:
+    st.warning("No option data available for the selected expiries.")
+    st.stop()
+
+# Ensure strikes/ivs sorted by strike
+sort_idx = np.argsort(strikes)
+strikes = strikes[sort_idx]
+days = days[sort_idx]
+ivs = ivs[sort_idx]
+
+# Create grid for smooth surface
+strike_grid = np.linspace(strikes.min(), strikes.max(), 50)
+expiry_grid = np.linspace(days.min(), days.max(), 25) if days.min() != days.max() else np.linspace(0, days.max(), 5)
+
+X, Y = np.meshgrid(strike_grid, expiry_grid)
+
+# Build Z using smooth RBF interpolation where possible, fallback to griddata
+points = np.column_stack((strikes, days))
+Z = None
+try:
+    # RBF creates a smooth interpolant from scattered data
+    # choose multiquadric for smooth waves; epsilon controls smoothness
+    eps = max((strikes.max()-strikes.min())/50.0, 1.0)
+    rbf = Rbf(strikes, days, ivs, function='multiquadric', epsilon=eps)
+    Z = rbf(X, Y)
+except Exception:
+    try:
+        Z = griddata(points, ivs, (X, Y), method=interpolation_method.lower())
+    except Exception:
+        Z = griddata(points, ivs, (X, Y), method='linear')
+
+# Build Z robustly. If all days equal (single expiry), do 1D interpolation across strikes
+Z = None
+if days.min() == days.max():
+    try:
+        interp_ivs = np.interp(strike_grid, strikes, ivs)
+        Z = np.tile(interp_ivs, (expiry_grid.size, 1))
+    except Exception as e:
+        st.error(f"Error interpolating implied vols: {e}")
+        st.stop()
+else:
+    try:
+        Z = griddata(points, ivs, (X, Y), method=interpolation_method.lower())
+    except Exception:
+        # fallback to linear
+        Z = griddata(points, ivs, (X, Y), method='linear')
+
+# If there are NaNs, try filling with nearest neighbor
+if Z is None or np.isnan(Z).any():
+    try:
+        Z_nearest = griddata(points, ivs, (X, Y), method='nearest')
+        if Z is None:
+            Z = Z_nearest
+        else:
+            Z = np.where(np.isnan(Z), Z_nearest, Z)
+    except Exception:
+        pass
+
+# Apply light gaussian smoothing to reduce jaggedness
+try:
+    if Z is not None and not np.isnan(Z).all():
+        # ensure no NaNs before smoothing
+        if np.isnan(Z).any():
+            Z = np.where(np.isnan(Z), np.nanmean(Z), Z)
+        Z = gaussian_filter(Z, sigma=1.0)
+except Exception:
+    pass
+
+# If we still have NaNs, fallback to a 2D line plot (strike vs IV) for this expiry
+if Z is None or np.isnan(Z).any():
+    st.warning("Could not construct a smooth 3D surface; showing interpolated strike-IV line instead.")
+    try:
+        import plotly.express as px
+        line_fig = px.line(x=strike_grid, y=np.interp(strike_grid, strikes, ivs), labels={'x':'Strike','y':'Implied Vol'})
+        st.plotly_chart(line_fig, use_container_width=True)
+    except Exception as e:
+        st.error(f"Error showing fallback IV line: {e}")
+    st.stop()
+
+# --------------------------
+# Plot 3D Surface
+# --------------------------
+fig = go.Figure(data=[go.Surface(
+    x=X,
+    y=Y,
+    z=Z,
+    colorscale='Viridis',
+    colorbar=dict(title='Implied Vol'),
+    cmin=np.nanmin(Z),
+    cmax=np.nanpercentile(Z, 99)
+)])
+
+fig.update_layout(
+    title=f"{ticker.upper()} {option_type.capitalize()} Implied Vol Surface",
+    scene=dict(
+        xaxis_title="Strike",
+        yaxis_title="Expiry (Days)",
+        zaxis_title="Implied Vol",
+        xaxis=dict(tickfont=dict(size=12), backgroundcolor='#0b0b0b', gridcolor='#333'),
+        yaxis=dict(tickfont=dict(size=12), backgroundcolor='#0b0b0b', gridcolor='#333'),
+        zaxis=dict(tickfont=dict(size=12), backgroundcolor='#0b0b0b', gridcolor='#333')
+    ),
+    template='plotly_dark',
+    autosize=True,
+    height=700
+)
+
+st.plotly_chart(fig, use_container_width=True)
+
+st.success("✅ Options Surface generated and cleaned successfully.")
