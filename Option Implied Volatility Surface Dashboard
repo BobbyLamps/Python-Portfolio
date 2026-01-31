@@ -1,269 +1,330 @@
 import streamlit as st
 import yfinance as yf
-import pandas as pd
 import numpy as np
-from scipy.interpolate import griddata, Rbf
-from scipy.ndimage import gaussian_filter
+import pandas as pd
 import plotly.graph_objects as go
-from datetime import datetime
+from scipy.interpolate import griddata
+from scipy.ndimage import gaussian_filter
+from scipy.optimize import minimize
+from scipy.stats import norm
 
-st.set_page_config(page_title="Options Surface Cleaner & Interpolator", layout="wide")
+# ======================================================
+# Page Config
+# ======================================================
+st.set_page_config(page_title="Equity Volatility Surface", layout="wide")
+st.title("Equity Options Volatility Surface")
 
-st.markdown("<h1 style='color:#FFFFFF;'>Options Surface Cleaner & Interpolator</h1>", unsafe_allow_html=True)
-
-# Dark theme CSS
-st.markdown(
-    """
-    <style>
-    /* Page background and main text */
-    .reportview-container, .main, .block-container, .stApp { background-color:#0b0b0b; color:#ffffff; }
-    /* Sidebar container */
-    [role="complementary"] { background-color:#0b0b0b !important; color:#ffffff !important; }
-    /* Make labels and widget text in the sidebar white */
-    [role="complementary"] label, [role="complementary"] .stTextInput, [role="complementary"] .stSelectbox, [role="complementary"] .stMultiSelect { color:#ffffff !important; }
-    /* Ticker input: black text on white background for readability */
-    [role="complementary"] input[type="text"] { color:#000000 !important; background-color:#ffffff !important; border:1px solid #444 !important; }
-    /* DataFrame styling (keep dark) */
-    [data-testid="stDataFrame"] { background-color:#0b0b0b !important; color:#ffffff !important; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# --------------------------
+# ======================================================
 # Sidebar Controls
-# --------------------------
-st.sidebar.markdown("<h3 style='color:#000000;'>Inputs</h3>", unsafe_allow_html=True)
+# ======================================================
+st.sidebar.header("Inputs")
 
-ticker = st.sidebar.text_input("Ticker", value="AAPL").upper()
+ticker = st.sidebar.text_input("Ticker", "AAPL").upper()
 option_type = st.sidebar.selectbox("Option Type", ["call", "put"])
-expiry_select = None
+display_mode = st.sidebar.radio("Display Mode", ["Surface", "Market Points"])
+moneyness_range = st.sidebar.slider("Strike Range (% of Spot)", 0.7, 1.3, (0.8, 1.2))
+show_heston = st.sidebar.checkbox("Show Heston Fair Value", True)
+use_forward = st.sidebar.checkbox("Use Forward-Moneyness", False)
+use_delta = st.sidebar.checkbox("Use Delta X-axis (instead of Moneyness)", False)
+advanced = st.sidebar.checkbox("Advanced: Select Expiries", False)
 
-interpolation_method = st.sidebar.selectbox("Interpolation Method", ["Cubic", "Linear", "Nearest"])
-
-# --------------------------
-# Load Option Chain
-# --------------------------
+# ======================================================
+# Load Options Data
+# ======================================================
 @st.cache_data
-def load_option_chain(ticker):
-    """Return a list of expirations for `ticker` (pickle-serializable)."""
-    try:
-        stock = yf.Ticker(ticker)
-        expirations = list(stock.options or [])
-        return expirations
-    except Exception as e:
-        st.error(f"Error loading ticker {ticker}: {e}")
-        return []
-
-expirations = load_option_chain(ticker)
-
-if not expirations:
-    st.warning(f"No option expirations found for {ticker}.")
-
-# Allow multi-select of expirations to build a true 2D surface across expiry axis
-expiry_selects = st.sidebar.multiselect("Expiration Date(s)", options=expirations, default=(expirations[:2] if expirations else []))
-if not expiry_selects:
-    st.warning("Please select one or more expiration dates to build the surface.")
-    st.stop()
-
-# For downstream compatibility use the first selected expiry when a single-expiry table is needed
-expiry_select = expiry_selects[0]
-
-@st.cache_data
-def get_option_data(ticker, expiry, option_type):
-    """Fetch and clean option chain DataFrame for (ticker, expiry, option_type)."""
+def load_options(ticker, option_type):
     stock = yf.Ticker(ticker)
-    if option_type == "call":
-        df = stock.option_chain(expiry).calls
-    else:
-        df = stock.option_chain(expiry).puts
-    # Normalize implied vol column name (yfinance uses 'impliedVolatility')
-    if 'impliedVol' in df.columns:
-        vol_col = 'impliedVol'
-    elif 'impliedVolatility' in df.columns:
-        vol_col = 'impliedVolatility'
-        df = df.rename(columns={vol_col: 'impliedVol'})
-        vol_col = 'impliedVol'
-    else:
-        st.warning("Option chain does not contain implied volatility column.")
-        return pd.DataFrame()
+    spot = stock.history(period="1d")["Close"].iloc[-1]
 
-    # Clean data
-    df = df[df['impliedVol'].notnull()]
-    df = df[df['impliedVol'] > 0]
-    df = df[df['impliedVol'] < 3.0]  # Remove extreme outliers (>300%)
-    return df
-
-df = get_option_data(ticker, expiry_select, option_type)
-
-if df.empty:
-    st.warning("No valid options data available for this expiry and type.")
-    st.stop()
-
-# Show header with all selected expiries
-exp_label = ", ".join(expiry_selects)
-st.subheader(f"{ticker.upper()} {option_type.capitalize()} Options - Expiry(s): {exp_label}")
-
-# Build combined table for all selected expiries
-def build_combined_df(ticker, expiries, option_type):
     rows = []
-    for exp in expiries:
-        dfe = get_option_data(ticker, exp, option_type)
-        if dfe.empty:
-            continue
-        try:
-            dt = pd.to_datetime(exp)
-            days = max(1, (dt.date() - pd.Timestamp.today().date()).days)
-        except Exception:
-            days = 30
-        dfe = dfe.copy()
-        dfe['expiry'] = exp
-        dfe['days_to_expiry'] = days
-        rows.append(dfe[['expiry','days_to_expiry','strike','lastPrice','impliedVol','volume','openInterest']])
-    if not rows:
-        return pd.DataFrame()
-    return pd.concat(rows, ignore_index=True)
+    for exp in stock.options:
+        chain = stock.option_chain(exp)
+        df = chain.calls if option_type == "call" else chain.puts
+        df = df[df.impliedVolatility > 0]
+        df["expiry"] = exp
+        df["days"] = (pd.to_datetime(exp) - pd.Timestamp.today()).days
+        df["moneyness"] = df["strike"] / spot
+        rows.append(df)
 
-combined_df = build_combined_df(ticker, expiry_selects, option_type)
-if combined_df.empty:
-    st.warning("No options data to display for selected expiries.")
-else:
-    st.dataframe(combined_df.reset_index(drop=True))
+    return spot, pd.concat(rows, ignore_index=True)
 
-# --------------------------
-# Interpolation / Surface
-# --------------------------
-def build_surface_points(ticker, expiries, option_type):
-    """Fetch option data for each expiry and return arrays of strikes, days_to_expiry, ivs."""
-    strikes_all = []
-    days_all = []
-    ivs_all = []
-    for exp in expiries:
-        dfe = get_option_data(ticker, exp, option_type)
-        if dfe.empty:
-            continue
-        try:
-            dt = pd.to_datetime(exp)
-            days = max(1, (dt.date() - pd.Timestamp.today().date()).days)
-        except Exception:
-            days = 30
-        svals = dfe['strike'].values
-        ivvals = dfe['impliedVol'].values
-        strikes_all.extend(svals.tolist())
-        days_all.extend([days] * len(svals))
-        ivs_all.extend(ivvals.tolist())
-    return np.array(strikes_all), np.array(days_all), np.array(ivs_all)
+spot, df = load_options(ticker, option_type)
 
-# Build surface point cloud from selected expiries
-strikes, days, ivs = build_surface_points(ticker, expiry_selects, option_type)
+df = df[
+    (df.moneyness >= moneyness_range[0]) &
+    (df.moneyness <= moneyness_range[1]) &
+    (df.days > 0)
+]
 
-if strikes.size == 0:
-    st.warning("No option data available for the selected expiries.")
-    st.stop()
+if advanced:
+    selected_expiries = st.sidebar.multiselect(
+        "Select Expiries",
+        sorted(df.expiry.unique()),
+        default=sorted(df.expiry.unique())
+    )
+    df = df[df.expiry.isin(selected_expiries)]
 
-# Ensure strikes/ivs sorted by strike
-sort_idx = np.argsort(strikes)
-strikes = strikes[sort_idx]
-days = days[sort_idx]
-ivs = ivs[sort_idx]
+# ======================================================
+# Heston Model
+# ======================================================
+def heston_iv(T, params):
+    kappa, theta, sigma, rho, v0 = params
+    return np.sqrt(theta + (v0 - theta) * np.exp(-kappa * T / 365))
 
-# Create grid for smooth surface
-strike_grid = np.linspace(strikes.min(), strikes.max(), 50)
-expiry_grid = np.linspace(days.min(), days.max(), 25) if days.min() != days.max() else np.linspace(0, days.max(), 5)
+def loss(params):
+    return np.mean(
+        (heston_iv(df.days.values, params) - df.impliedVolatility.values) ** 2
+    )
 
-X, Y = np.meshgrid(strike_grid, expiry_grid)
-
-# Build Z using smooth RBF interpolation where possible, fallback to griddata
-points = np.column_stack((strikes, days))
-Z = None
-try:
-    # RBF creates a smooth interpolant from scattered data
-    # choose multiquadric for smooth waves; epsilon controls smoothness
-    eps = max((strikes.max()-strikes.min())/50.0, 1.0)
-    rbf = Rbf(strikes, days, ivs, function='multiquadric', epsilon=eps)
-    Z = rbf(X, Y)
-except Exception:
-    try:
-        Z = griddata(points, ivs, (X, Y), method=interpolation_method.lower())
-    except Exception:
-        Z = griddata(points, ivs, (X, Y), method='linear')
-
-# Build Z robustly. If all days equal (single expiry), do 1D interpolation across strikes
-Z = None
-if days.min() == days.max():
-    try:
-        interp_ivs = np.interp(strike_grid, strikes, ivs)
-        Z = np.tile(interp_ivs, (expiry_grid.size, 1))
-    except Exception as e:
-        st.error(f"Error interpolating implied vols: {e}")
-        st.stop()
-else:
-    try:
-        Z = griddata(points, ivs, (X, Y), method=interpolation_method.lower())
-    except Exception:
-        # fallback to linear
-        Z = griddata(points, ivs, (X, Y), method='linear')
-
-# If there are NaNs, try filling with nearest neighbor
-if Z is None or np.isnan(Z).any():
-    try:
-        Z_nearest = griddata(points, ivs, (X, Y), method='nearest')
-        if Z is None:
-            Z = Z_nearest
-        else:
-            Z = np.where(np.isnan(Z), Z_nearest, Z)
-    except Exception:
-        pass
-
-# Apply light gaussian smoothing to reduce jaggedness
-try:
-    if Z is not None and not np.isnan(Z).all():
-        # ensure no NaNs before smoothing
-        if np.isnan(Z).any():
-            Z = np.where(np.isnan(Z), np.nanmean(Z), Z)
-        Z = gaussian_filter(Z, sigma=1.0)
-except Exception:
-    pass
-
-# If we still have NaNs, fallback to a 2D line plot (strike vs IV) for this expiry
-if Z is None or np.isnan(Z).any():
-    st.warning("Could not construct a smooth 3D surface; showing interpolated strike-IV line instead.")
-    try:
-        import plotly.express as px
-        line_fig = px.line(x=strike_grid, y=np.interp(strike_grid, strikes, ivs), labels={'x':'Strike','y':'Implied Vol'})
-        st.plotly_chart(line_fig, use_container_width=True)
-    except Exception as e:
-        st.error(f"Error showing fallback IV line: {e}")
-    st.stop()
-
-# --------------------------
-# Plot 3D Surface
-# --------------------------
-fig = go.Figure(data=[go.Surface(
-    x=X,
-    y=Y,
-    z=Z,
-    colorscale='Viridis',
-    colorbar=dict(title='Implied Vol'),
-    cmin=np.nanmin(Z),
-    cmax=np.nanpercentile(Z, 99)
-)])
-
-fig.update_layout(
-    title=f"{ticker.upper()} {option_type.capitalize()} Implied Vol Surface",
-    scene=dict(
-        xaxis_title="Strike",
-        yaxis_title="Expiry (Days)",
-        zaxis_title="Implied Vol",
-        xaxis=dict(tickfont=dict(size=12), backgroundcolor='#0b0b0b', gridcolor='#333'),
-        yaxis=dict(tickfont=dict(size=12), backgroundcolor='#0b0b0b', gridcolor='#333'),
-        zaxis=dict(tickfont=dict(size=12), backgroundcolor='#0b0b0b', gridcolor='#333')
-    ),
-    template='plotly_dark',
-    autosize=True,
-    height=700
+res = minimize(
+    loss,
+    [1.5, 0.04, 0.5, -0.5, 0.04],
+    bounds=[(0.01,5),(0.01,1),(0.01,2),(-0.99,0.99),(0.01,1)]
 )
 
-st.plotly_chart(fig, use_container_width=True)
+df["heston_iv"] = heston_iv(df.days.values, res.x)
 
-st.success("✅ Options Surface generated and cleaned successfully.")
+# ======================================================
+# Forward / Delta Axis
+# ======================================================
+def forward_price(S, T, r=0.01, q=0.0):
+    return S * np.exp((r - q) * T / 365)
+
+if use_forward:
+    df["forward"] = df["days"].apply(lambda x: forward_price(spot, x))
+    df["moneyness_fwd"] = df["strike"] / df["forward"]
+    x_axis_label = "Forward-Moneyness (K / F)"
+else:
+    df["moneyness_fwd"] = df["moneyness"]
+    x_axis_label = "Moneyness (K / Spot)"
+
+def black_scholes_delta(S, K, T, r, sigma, option_type="call"):
+    T = np.maximum(T / 365, 1e-6)
+    d1 = (np.log(S / K) + 0.5 * sigma**2 * T) / (sigma * np.sqrt(T))
+    return norm.cdf(d1) if option_type == "call" else norm.cdf(d1) - 1
+
+if use_delta:
+    df["delta"] = df.apply(
+        lambda r: black_scholes_delta(
+            spot, r["strike"], r["days"], 0.01, r["impliedVolatility"], option_type
+        ),
+        axis=1
+    )
+    x_data = df["delta"].values
+    x_axis_label = "Delta"
+else:
+    x_data = df["moneyness_fwd"].values
+
+# ======================================================
+# Stable Surface Builder
+# ======================================================
+def build_surface(x, y, z, Xg, Yg):
+    Z_lin = griddata((x, y), z, (Xg, Yg), method="linear")
+    Z_near = griddata((x, y), z, (Xg, Yg), method="nearest")
+    Z = np.where(np.isnan(Z_lin), Z_near, Z_lin)
+    return gaussian_filter(Z, sigma=1.2)
+
+# ======================================================
+# Build Surfaces
+# ======================================================
+x_grid = np.linspace(x_data.min(), x_data.max(), 45)
+t_grid = np.linspace(df.days.min(), df.days.max(), 35)
+Xg, Yg = np.meshgrid(x_grid, t_grid)
+
+Z_mkt = build_surface(x_data, df.days.values, df.impliedVolatility.values, Xg, Yg)
+Z_hes = build_surface(x_data, df.days.values, df.heston_iv.values, Xg, Yg)
+Z_diff = Z_mkt - Z_hes
+
+# ======================================================
+# Relative Value Callouts (NEW)
+# ======================================================
+diff_flat = df.impliedVolatility.values - df.heston_iv.values
+rich_idx = np.argmax(diff_flat)
+cheap_idx = np.argmin(diff_flat)
+
+rich_row = df.iloc[rich_idx]
+cheap_row = df.iloc[cheap_idx]
+
+st.markdown("### Relative Value Highlights")
+st.markdown(
+    f"""
+**Richest pocket vs model:**  
+{rich_row['strike']:.0f} strike • {int(rich_row['days'])}D expiry • **+{diff_flat[rich_idx]:.2f} vols vs Heston**
+
+**Cheapest pocket vs model:**  
+{cheap_row['strike']:.0f} strike • {int(cheap_row['days'])}D expiry • **{diff_flat[cheap_idx]:.2f} vols vs Heston**
+
+*Relative to fitted Heston surface*
+"""
+)
+
+# ======================================================
+# Axis Legend
+# ======================================================
+axis_legend = dict(
+    text=(
+        "<b>Axis Guide</b><br>"
+        f"X: {x_axis_label}<br>"
+        "Y: Time to Expiry (Days)<br>"
+        "Z: Implied Volatility"
+    ),
+    showarrow=False,
+    x=1.05,
+    y=0.95,
+    xref="paper",
+    yref="paper",
+    align="left",
+    font=dict(size=11)
+)
+
+# ======================================================
+# Market & Heston Charts
+# ======================================================
+col1, col2 = st.columns(2)
+
+with col1:
+    fig_market = go.Figure()
+    if display_mode == "Surface":
+        fig_market.add_surface(x=Xg, y=Yg, z=Z_mkt, colorscale="Viridis")
+    else:
+        fig_market.add_scatter3d(
+            x=df.strike, y=df.days, z=df.impliedVolatility,
+            mode="markers",
+            marker=dict(size=4, color=df.impliedVolatility, colorscale="Viridis")
+        )
+
+    fig_market.update_layout(
+        title="Market Implied Volatility",
+        scene=dict(
+            xaxis_title=x_axis_label if display_mode == "Surface" else "Strike",
+            yaxis_title="Time to Expiry (Days)",
+            zaxis_title="Implied Volatility"
+        ),
+        annotations=[axis_legend],
+        template="plotly_dark",
+        height=650
+    )
+    st.plotly_chart(fig_market, use_container_width=True)
+
+with col2:
+    if show_heston:
+        fig_heston = go.Figure()
+        if display_mode == "Surface":
+            fig_heston.add_surface(x=Xg, y=Yg, z=Z_hes, colorscale="Plasma")
+        else:
+            fig_heston.add_scatter3d(
+                x=df.strike, y=df.days, z=df.heston_iv,
+                mode="markers",
+                marker=dict(size=4, color=df.heston_iv, colorscale="Plasma")
+            )
+
+        fig_heston.update_layout(
+            title="Heston Fair Value",
+            scene=dict(
+                xaxis_title=x_axis_label if display_mode == "Surface" else "Strike",
+                yaxis_title="Time to Expiry (Days)",
+                zaxis_title="Implied Volatility"
+            ),
+            annotations=[axis_legend],
+            template="plotly_dark",
+            height=650
+        )
+        st.plotly_chart(fig_heston, use_container_width=True)
+
+# ======================================================
+# Market − Model Difference
+# ======================================================
+if show_heston:
+    fig_diff = go.Figure()
+    if display_mode == "Surface":
+        fig_diff.add_surface(
+            x=Xg, y=Yg, z=Z_diff,
+            colorscale="RdBu",
+            cmin=-np.nanmax(abs(Z_diff)),
+            cmax=np.nanmax(abs(Z_diff))
+        )
+    else:
+        fig_diff.add_scatter3d(
+            x=df.strike,
+            y=df.days,
+            z=df.impliedVolatility - df.heston_iv,
+            mode="markers",
+            marker=dict(size=4, color=df.impliedVolatility - df.heston_iv, colorscale="RdBu")
+        )
+
+    fig_diff.update_layout(
+        title="Market − Model Volatility",
+        scene=dict(
+            xaxis_title=x_axis_label if display_mode == "Surface" else "Strike",
+            yaxis_title="Time to Expiry (Days)",
+            zaxis_title="Vol Difference"
+        ),
+        annotations=[axis_legend],
+        template="plotly_dark",
+        height=650
+    )
+    st.plotly_chart(fig_diff, use_container_width=True)
+
+# ======================================================
+# Skew Slice + Skew Metric (FIXED)
+# ======================================================
+st.subheader("Skew Slice")
+
+# ATM selection (always safe)
+atm = df.iloc[(df["moneyness_fwd"] - 1.0).abs().argsort()[:1]]
+
+skew_value = None
+
+if "delta" in df.columns:
+    # True delta-based skew
+    puts = df[df["delta"] < 0]
+    if not puts.empty and not atm.empty:
+        p25 = puts.iloc[(puts["delta"] + 0.25).abs().argsort()[:1]]
+        skew_value = (
+            p25["impliedVolatility"].values[0]
+            - atm["impliedVolatility"].values[0]
+        )
+        skew_label = "Downside Skew (25Δ Put − ATM)"
+
+else:
+    # Moneyness proxy skew (clean fallback)
+    puts = df[df["moneyness_fwd"] < 0.9]
+    if not puts.empty and not atm.empty:
+        p_proxy = puts.iloc[
+            (puts["moneyness_fwd"] - 0.9).abs().argsort()[:1]
+        ]
+        skew_value = (
+            p_proxy["impliedVolatility"].values[0]
+            - atm["impliedVolatility"].values[0]
+        )
+        skew_label = "Downside Skew (90% Moneyness − ATM)"
+
+if skew_value is not None:
+    st.markdown(f"**{skew_label}: {skew_value:.2f} vols**")
+
+
+# ======================================================
+# ATM Term-Structure Ribbon
+# ======================================================
+st.subheader("ATM Term-Structure")
+
+df["atm_diff"] = np.abs(df["moneyness_fwd"] - 1.0)
+atm_df = df.loc[df.groupby("expiry")["atm_diff"].idxmin()]
+
+fig_atm = go.Figure()
+fig_atm.add_trace(go.Scatter(
+    x=atm_df.days, y=atm_df.impliedVolatility,
+    mode="lines+markers", name="ATM Market IV"
+))
+fig_atm.add_trace(go.Scatter(
+    x=atm_df.days, y=atm_df.heston_iv,
+    mode="lines", name="ATM Heston IV"
+))
+
+fig_atm.update_layout(
+    title="ATM Vol Term-Structure",
+    xaxis_title="Time to Expiry (Days)",
+    yaxis_title="Implied Volatility",
+    template="plotly_dark"
+)
+st.plotly_chart(fig_atm, use_container_width=True)
